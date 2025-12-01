@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 # ----------------- ฟังก์ชันจัดการ Google Sheets -----------------
 
+# ชื่อ Worksheet ที่คุณใช้ (เปลี่ยนเป็นชื่อจริงถ้าไม่ใช่ 'Sheet1')
+WORKSHEET_NAME = "Sheet1" 
+
 def get_sheets_client():
     """สร้าง Client สำหรับเชื่อมต่อ Google Sheets โดยใช้ JSON Key String"""
     if not SERVICE_ACCOUNT_JSON_STR:
@@ -48,18 +51,16 @@ def get_sheets_client():
     try:
         credentials_json = json.loads(SERVICE_ACCOUNT_JSON_STR)
         gc = gspread.service_account_from_dict(credentials_json)
-        # แก้ไขบรรทัดนี้: ใช้ชื่อแท็บจริงแทน sheet1
-        # ตัวอย่าง: ถ้าชื่อแท็บคือ "บันทึก"
-        # return gc.open_by_key(SHEET_ID).worksheet("บันทึก") 
         
-        # **ถ้าชื่อแท็บคือ Sheet1** (ตามค่าเริ่มต้น) 
-        return gc.open_by_key(SHEET_ID).sheet1
+        # แก้ไขบรรทัดนี้: ใช้ชื่อแท็บจริง (จากตัวแปรด้านบน) 
+        return gc.open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
         
     except Exception as e:
         # Gunicorn จะ Crash ที่นี่ถ้าการเชื่อมต่อ API ล้มเหลว (เช่น 403 Forbidden)
-        logger.error(f"Error connecting to Google Sheets. Check SHEET_ID or JSON format: {e}")
-        return None
-
+        logger.error(f"FATAL GSPREAD ERROR DURING STARTUP: {e}")
+        # เพิ่ม raise เพื่อให้ Gunicorn log error ได้ชัดเจนขึ้น
+        raise ConnectionRefusedError(f"Failed to connect to Google Sheets during startup: {e}") 
+        
 def append_to_sheet(data_list):
     """บันทึกข้อมูลเป็นแถวใหม่"""
     try:
