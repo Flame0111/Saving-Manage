@@ -1,22 +1,23 @@
-# app.py - โค้ดที่ปรับปรุงและใส่ Key/ID โดยตรง (Hardcoded)
-import os
+# main.py - โค้ดสำหรับ Google Cloud Functions (GCF)
+# GCF ใช้โมเดลการทำงานแบบ Serverless โดยมีฟังก์ชันเดียวที่รับ HTTP Request
+# เราจะใช้ Bot.send_message() แทนการใช้ Dispatcher และ Context
+
 import json
 import logging
 from datetime import datetime
 from telegram import Bot, Update
-from telegram.ext import Dispatcher, MessageHandler, filters, CommandHandler
-from flask import Flask, request
+from telegram.constants import ParseMode
 import gspread
+from google.cloud import secretmanager
 
 # ----------------- การตั้งค่าตัวแปรและ Logging (Hardcoded) -----------------
 
-# *** คำเตือน: ข้อมูลเหล่านี้ถูก Hardcode เพื่อความรวดเร็ว แต่ควรใช้ Environment Variables ใน Production ***
+# *** คำเตือน: ข้อมูลเหล่านี้ถูก Hardcode เพื่อความรวดเร็ว แต่ควรใช้ Environment Variables/Secret Manager ใน Production ***
 
 TELEGRAM_TOKEN = "7691692707:AAEKyr9i-CxHDSm_NA5qD8skqjkvUCO1d5E"
 SHEET_ID = "1nulgbPOAUeDBTzm9tdhym08rpDqpoD0lj_8ebRRO1Cs"
 
 # JSON Key ของ Service Account ที่นำมาวางโดยตรง
-# Python สามารถจัดการข้อความหลายบรรทัดที่มีเครื่องหมายคำพูดได้
 SERVICE_ACCOUNT_JSON_STR = """
 {
   "type": "service_account",
@@ -39,34 +40,37 @@ logger = logging.getLogger(__name__)
 
 # ----------------- ฟังก์ชันจัดการ Google Sheets -----------------
 
-# ชื่อ Worksheet ที่คุณใช้ (เปลี่ยนเป็นชื่อจริงถ้าไม่ใช่ 'Sheet1')
 WORKSHEET_NAME = "Sheet1" 
+GLOBAL_SHEETS_CLIENT = None
 
 def get_sheets_client():
-    """สร้าง Client สำหรับเชื่อมต่อ Google Sheets โดยใช้ JSON Key String"""
-    if not SERVICE_ACCOUNT_JSON_STR:
-        logger.error("SERVICE_ACCOUNT_JSON_KEY is missing (should not happen if hardcoded).")
-        return None
+    """สร้าง Client สำหรับเชื่อมต่อ Google Sheets แบบ Lazy Loading"""
+    global GLOBAL_SHEETS_CLIENT
+    
+    if GLOBAL_SHEETS_CLIENT:
+        return GLOBAL_SHEETS_CLIENT
         
     try:
         credentials_json = json.loads(SERVICE_ACCOUNT_JSON_STR)
         gc = gspread.service_account_from_dict(credentials_json)
         
-        # แก้ไขบรรทัดนี้: ใช้ชื่อแท็บจริง (จากตัวแปรด้านบน) 
-        return gc.open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
+        # เปิด Spreadsheet และ Worksheet
+        spreadsheet = gc.open_by_key(SHEET_ID)
+        worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+        
+        GLOBAL_SHEETS_CLIENT = worksheet
+        logger.info("Successfully connected to Google Sheets.")
+        return worksheet
         
     except Exception as e:
-        # Gunicorn จะ Crash ที่นี่ถ้าการเชื่อมต่อ API ล้มเหลว (เช่น 403 Forbidden)
-        logger.error(f"FATAL GSPREAD ERROR DURING STARTUP: {e}")
-        # เพิ่ม raise เพื่อให้ Gunicorn log error ได้ชัดเจนขึ้น
-        raise ConnectionRefusedError(f"Failed to connect to Google Sheets during startup: {e}") 
-        
+        logger.error(f"GSPREAD ERROR: Failed to connect or access worksheet: {e}")
+        return None 
+
 def append_to_sheet(data_list):
     """บันทึกข้อมูลเป็นแถวใหม่"""
     try:
         worksheet = get_sheets_client()
         if worksheet:
-            # เพิ่มข้อมูล
             worksheet.append_row(data_list)
             return True
         return False
@@ -74,13 +78,14 @@ def append_to_sheet(data_list):
         logger.error(f"Error appending row to Google Sheets: {e}")
         return False
 
-# ----------------- ฟังก์ชันจัดการ Telegram Handlers -----------------
+# ----------------- ฟังก์ชันจัดการ Telegram Handlers (Synchronous) -----------------
 
-async def start(update: Update, context):
+def handle_start(bot: Bot, update: Update, chat_id: int):
     """ตอบกลับคำสั่ง /start"""
-    await update.message.reply_text("👋 สวัสดี! โปรดใช้รูปแบบ: **/จ่าย [จำนวนเงิน] [รายการ]** หรือ **/รับ [จำนวนเงิน] [รายการ]**", parse_mode='Markdown')
+    message = "👋 สวัสดี! โปรดใช้รูปแบบ: **/จ่าย [จำนวนเงิน] [รายการ]** หรือ **/รับ [จำนวนเงิน] [รายการ]**"
+    bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN)
 
-async def handle_text(update: Update, context):
+def handle_text_message(bot: Bot, update: Update, chat_id: int):
     """ประมวลผลข้อความที่ได้รับ (สำหรับการบันทึก)"""
     text = update.message.text
     
@@ -104,7 +109,7 @@ async def handle_text(update: Update, context):
             if append_to_sheet(record):
                 response = f"✅ บันทึก **{transaction_type}** {amount:,.2f} บาท ({description}) เรียบร้อยแล้ว"
             else:
-                response = "❌ บันทึกไม่สำเร็จ โปรดตรวจสอบการตั้งค่า Sheets และ Service Account"
+                response = "❌ บันทึกไม่สำเร็จ! กรุณาตรวจสอบว่า Service Account มีสิทธิ์ Editor ใน Google Sheet"
         else:
             response = "⚠️ รูปแบบไม่ถูกต้อง โปรดใช้: **/จ่าย [จำนวนเงิน] [รายการ]**"
     
@@ -114,41 +119,59 @@ async def handle_text(update: Update, context):
         logger.error(f"Unhandled error in handle_text: {e}")
         response = f"⚠️ เกิดข้อผิดพลาดภายใน: {e}"
         
-    await update.message.reply_text(response, parse_mode='Markdown')
+    bot.send_message(chat_id=chat_id, text=response, parse_mode=ParseMode.MARKDOWN)
 
-async def handle_photo(update: Update, context):
+def handle_photo_message(bot: Bot, update: Update, chat_id: int):
     """จัดการรูปภาพสลิป"""
-    await update.message.reply_text("รูปภาพถูกรับแล้ว แต่การอ่านสลิปอัตโนมัติ (OCR/AI) ยังต้องพัฒนาเพิ่มเติมในโค้ด")
+    bot.send_message(chat_id=chat_id, text="รูปภาพถูกรับแล้ว แต่การอ่านสลิปอัตโนมัติ (OCR/AI) ยังต้องพัฒนาเพิ่มเติมในโค้ด")
 
 
-# ----------------- การตั้งค่า Web Server (Flask) -----------------
+# ----------------- GCF Entry Point -----------------
 
-# ใช้ Flask เพื่อรับ Webhook
-app = Flask(__name__)
-bot = Bot(TELEGRAM_TOKEN)
-dispatcher = Dispatcher(bot, None)
-
-# เพิ่ม Handlers ให้กับ Dispatcher
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-dispatcher.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-@app.route('/', methods=['POST'])
-async def webhook_handler():
+def telegram_webhook(request):
     """
-    ฟังก์ชัน Webhook หลักที่รับ POST Request จาก Telegram
+    ฟังก์ชันหลักที่รับ HTTP Request จาก Telegram (Google Cloud Function Entry Point)
     """
+    
+    # 1. Health Check (GET Request)
+    if request.method == "GET":
+        return "Bot is running! (GCF)", 200
+
+    # 2. Process Telegram Update (POST Request)
     if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), bot)
-        await dispatcher.process_update(update)
-    return 'ok'
+        
+        # รับ JSON body จาก Request
+        request_data = request.get_json(silent=True)
+        if not request_data:
+            return 'No update data received', 200
+            
+        try:
+            # สร้าง Update object
+            bot_instance = Bot(TELEGRAM_TOKEN)
+            update = Update.de_json(request_data, bot_instance)
+        except Exception as e:
+            logger.error(f"Error parsing update JSON: {e}")
+            return 'Invalid update format', 200
+            
+        # ตรวจสอบประเภทของการ Update และเรียกใช้ Handler ที่เหมาะสม
+        if update.message:
+            chat_id = update.message.chat_id
+            text = update.message.text
+            photo = update.message.photo
+            
+            if text:
+                # ตรวจสอบคำสั่ง /start
+                if text.lower() == '/start':
+                    handle_start(bot_instance, update, chat_id)
+                
+                # ตรวจสอบข้อความปกติ (สำหรับการบันทึก)
+                elif not text.startswith('/'):
+                    handle_text_message(bot_instance, update, chat_id)
+                
+            elif photo:
+                handle_photo_message(bot_instance, update, chat_id)
+                
+        # ต้องคืนค่า HTTP 200 (OK) เสมอ เพื่อบอก Telegram ว่ารับข้อความแล้ว
+        return 'ok', 200
 
-@app.route('/', methods=['GET'])
-def health_check():
-    """Health check endpoint สำหรับ Cloud Run"""
-    return "Bot is running!", 200
-
-# ----------------- การรัน Gunicorn (แก้ไขปัญหา PORT) -----------------
-
-# โค้ดนี้จะถูกรันโดย Gunicorn ผ่านไฟล์ Procfile
-# ดังนั้นจึงไม่จำเป็นต้องมี if __name__ == '__main__': app.run()
+    return 'Method not allowed', 405
