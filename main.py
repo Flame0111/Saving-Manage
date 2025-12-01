@@ -1,23 +1,24 @@
-# main.py - โค้ดสำหรับ Google Cloud Functions (GCF)
-# GCF ใช้โมเดลการทำงานแบบ Serverless โดยมีฟังก์ชันเดียวที่รับ HTTP Request
-# เราจะใช้ Bot.send_message() แทนการใช้ Dispatcher และ Context
+# app.py: Python Flask Application for Cloud Run Webhook
 
+import os
 import json
 import logging
 from datetime import datetime
 from telegram import Bot, Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
+from flask import Flask, request
 import gspread
-from google.cloud import secretmanager
 
-# ----------------- การตั้งค่าตัวแปรและ Logging (Hardcoded) -----------------
-
-# *** คำเตือน: ข้อมูลเหล่านี้ถูก Hardcode เพื่อความรวดเร็ว แต่ควรใช้ Environment Variables/Secret Manager ใน Production ***
+# ----------------- Configuration Variables (Hardcoded Keys) -----------------
+# [WARNING]: These keys are hardcoded for immediate deployment, 
+# please use Environment Variables or Secret Manager in production.
 
 TELEGRAM_TOKEN = "7691692707:AAEKyr9i-CxHDSm_NA5qD8skqjkvUCO1d5E"
 SHEET_ID = "1nulgbPOAUeDBTzm9tdhym08rpDqpoD0lj_8ebRRO1Cs"
+WORKSHEET_NAME = "Sheet1" # *** Change this if your actual worksheet tab name is different (e.g., "บันทึก") ***
 
-# JSON Key ของ Service Account ที่นำมาวางโดยตรง
+# Service Account JSON Key (Hardcoded)
 SERVICE_ACCOUNT_JSON_STR = """
 {
   "type": "service_account",
@@ -34,17 +35,17 @@ SERVICE_ACCOUNT_JSON_STR = """
 }
 """
 
-# ตั้งค่า Logging
+# ----------------- Logging Setup -----------------
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ----------------- ฟังก์ชันจัดการ Google Sheets -----------------
+# ----------------- GSPREAD LAZY LOADING -----------------
 
-WORKSHEET_NAME = "Sheet1" 
 GLOBAL_SHEETS_CLIENT = None
 
 def get_sheets_client():
-    """สร้าง Client สำหรับเชื่อมต่อ Google Sheets แบบ Lazy Loading"""
+    """Attempts to create and return the Google Sheets client (Lazy Loading)"""
     global GLOBAL_SHEETS_CLIENT
     
     if GLOBAL_SHEETS_CLIENT:
@@ -54,20 +55,20 @@ def get_sheets_client():
         credentials_json = json.loads(SERVICE_ACCOUNT_JSON_STR)
         gc = gspread.service_account_from_dict(credentials_json)
         
-        # เปิด Spreadsheet และ Worksheet
         spreadsheet = gc.open_by_key(SHEET_ID)
         worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
         
         GLOBAL_SHEETS_CLIENT = worksheet
-        logger.info("Successfully connected to Google Sheets.")
+        logger.info("Successfully connected to Google Sheets on demand.")
         return worksheet
         
     except Exception as e:
         logger.error(f"GSPREAD ERROR: Failed to connect or access worksheet: {e}")
+        # Does not crash the container on startup
         return None 
 
 def append_to_sheet(data_list):
-    """บันทึกข้อมูลเป็นแถวใหม่"""
+    """Appends a new row of data to the Google Sheet"""
     try:
         worksheet = get_sheets_client()
         if worksheet:
@@ -78,100 +79,89 @@ def append_to_sheet(data_list):
         logger.error(f"Error appending row to Google Sheets: {e}")
         return False
 
-# ----------------- ฟังก์ชันจัดการ Telegram Handlers (Synchronous) -----------------
+# ----------------- TELEGRAM HANDLERS -----------------
 
-def handle_start(bot: Bot, update: Update, chat_id: int):
-    """ตอบกลับคำสั่ง /start"""
-    message = "👋 สวัสดี! โปรดใช้รูปแบบ: **/จ่าย [จำนวนเงิน] [รายการ]** หรือ **/รับ [จำนวนเงิน] [รายการ]**"
-    bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN)
-
-def handle_text_message(bot: Bot, update: Update, chat_id: int):
-    """ประมวลผลข้อความที่ได้รับ (สำหรับการบันทึก)"""
-    text = update.message.text
-    
+def handle_message_response(bot: Bot, update: Update, response: str):
+    """Sends a formatted response back to Telegram"""
     try:
-        parts = text.split(maxsplit=2)
-        command = parts[0].lower()
-        
-        if command in ("/จ่าย", "/รับ") and len(parts) >= 3:
-            transaction_type = "รายจ่าย" if command == "/จ่าย" else "รายรับ"
-            amount = float(parts[1])
-            description = parts[2]
-            
-            record = [
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                transaction_type,
-                description,
-                amount,
-                "" # ช่องว่างสำหรับลิงก์สลิป
-            ]
-            
-            if append_to_sheet(record):
-                response = f"✅ บันทึก **{transaction_type}** {amount:,.2f} บาท ({description}) เรียบร้อยแล้ว"
-            else:
-                response = "❌ บันทึกไม่สำเร็จ! กรุณาตรวจสอบว่า Service Account มีสิทธิ์ Editor ใน Google Sheet"
-        else:
-            response = "⚠️ รูปแบบไม่ถูกต้อง โปรดใช้: **/จ่าย [จำนวนเงิน] [รายการ]**"
+        bot.send_message(chat_id=update.message.chat_id, text=response, parse_mode=ParseMode.MARKDOWN)
+    except TelegramError as e:
+        logger.error(f"Telegram send message failed: {e}")
+
+def process_text_message(bot: Bot, update: Update):
+    """Processes incoming text messages for expense/income tracking"""
+    text = update.message.text
+    response = ""
     
-    except ValueError:
-        response = "🚫 จำนวนเงินไม่ถูกต้อง โปรดใส่ตัวเลข"
-    except Exception as e:
-        logger.error(f"Unhandled error in handle_text: {e}")
-        response = f"⚠️ เกิดข้อผิดพลาดภายใน: {e}"
-        
-    bot.send_message(chat_id=chat_id, text=response, parse_mode=ParseMode.MARKDOWN)
-
-def handle_photo_message(bot: Bot, update: Update, chat_id: int):
-    """จัดการรูปภาพสลิป"""
-    bot.send_message(chat_id=chat_id, text="รูปภาพถูกรับแล้ว แต่การอ่านสลิปอัตโนมัติ (OCR/AI) ยังต้องพัฒนาเพิ่มเติมในโค้ด")
-
-
-# ----------------- GCF Entry Point -----------------
-
-def telegram_webhook(request):
-    """
-    ฟังก์ชันหลักที่รับ HTTP Request จาก Telegram (Google Cloud Function Entry Point)
-    """
+    if text and text.lower() == '/start':
+        response = "👋 สวัสดี! โปรดใช้รูปแบบ: **/จ่าย [จำนวนเงิน] [รายการ]** หรือ **/รับ [จำนวนเงิน] [รายการ]**"
     
-    # 1. Health Check (GET Request)
-    if request.method == "GET":
-        return "Bot is running! (GCF)", 200
-
-    # 2. Process Telegram Update (POST Request)
-    if request.method == "POST":
-        
-        # รับ JSON body จาก Request
-        request_data = request.get_json(silent=True)
-        if not request_data:
-            return 'No update data received', 200
-            
+    elif text and text.lower().startswith(('/จ่าย', '/รับ')):
         try:
-            # สร้าง Update object
-            bot_instance = Bot(TELEGRAM_TOKEN)
-            update = Update.de_json(request_data, bot_instance)
+            parts = text.split(maxsplit=2)
+            command = parts[0].lower()
+            if len(parts) < 3:
+                 response = "⚠️ รูปแบบไม่ถูกต้อง โปรดใช้: **/จ่าย [จำนวนเงิน] [รายการ]**"
+                 
+            else:
+                transaction_type = "รายจ่าย" if command == "/จ่าย" else "รายรับ"
+                amount = float(parts[1])
+                description = parts[2]
+                
+                record = [
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    transaction_type,
+                    description,
+                    amount,
+                    "" 
+                ]
+                
+                if append_to_sheet(record):
+                    response = f"✅ บันทึก **{transaction_type}** {amount:,.2f} บาท ({description}) เรียบร้อยแล้ว"
+                else:
+                    response = "❌ บันทึกไม่สำเร็จ! กรุณาตรวจสอบว่า Service Account มีสิทธิ์ Editor ใน Google Sheet"
+        
+        except ValueError:
+            response = "🚫 จำนวนเงินไม่ถูกต้อง โปรดใส่ตัวเลข"
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+            response = f"⚠️ เกิดข้อผิดพลาดภายใน: {e}"
+            
+    else:
+        return 
+
+    handle_message_response(bot, update, response)
+
+def process_photo_message(bot: Bot, update: Update):
+    """Handles incoming photo messages (simulates OCR failure)"""
+    response = "รูปภาพถูกรับแล้ว แต่การอ่านสลิปอัตโนมัติ (OCR/AI) ยังต้องพัฒนาเพิ่มเติมในโค้ด"
+    handle_message_response(bot, update, response)
+
+
+# ----------------- FLASK/GUNICORN WEBHOOK ENDPOINTS -----------------
+
+app = Flask(__name__)
+bot = Bot(TELEGRAM_TOKEN)
+
+@app.route('/', methods=['POST'])
+def webhook_handler():
+    """Main Webhook endpoint receiving POST requests from Telegram"""
+    if request.method == "POST":
+        try:
+            update = Update.de_json(request.get_json(force=True), bot)
         except Exception as e:
             logger.error(f"Error parsing update JSON: {e}")
             return 'Invalid update format', 200
             
-        # ตรวจสอบประเภทของการ Update และเรียกใช้ Handler ที่เหมาะสม
         if update.message:
-            chat_id = update.message.chat_id
-            text = update.message.text
-            photo = update.message.photo
-            
-            if text:
-                # ตรวจสอบคำสั่ง /start
-                if text.lower() == '/start':
-                    handle_start(bot_instance, update, chat_id)
+            if update.message.text:
+                process_text_message(bot, update)
+            elif update.message.photo:
+                process_photo_message(bot, update)
                 
-                # ตรวจสอบข้อความปกติ (สำหรับการบันทึก)
-                elif not text.startswith('/'):
-                    handle_text_message(bot_instance, update, chat_id)
-                
-            elif photo:
-                handle_photo_message(bot_instance, update, chat_id)
-                
-        # ต้องคืนค่า HTTP 200 (OK) เสมอ เพื่อบอก Telegram ว่ารับข้อความแล้ว
-        return 'ok', 200
+    return 'ok', 200 # Always return 200 OK
 
-    return 'Method not allowed', 405
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint for Cloud Run"""
+    return "Bot is running on Cloud Run!", 200
