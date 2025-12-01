@@ -48,9 +48,15 @@ def get_sheets_client():
     try:
         credentials_json = json.loads(SERVICE_ACCOUNT_JSON_STR)
         gc = gspread.service_account_from_dict(credentials_json)
-        # ใช้ .worksheet('Sheet1') ถ้าคุณไม่ได้เปลี่ยนชื่อแท็บ
-        return gc.open_by_key(SHEET_ID).sheet1 
+        # แก้ไขบรรทัดนี้: ใช้ชื่อแท็บจริงแทน sheet1
+        # ตัวอย่าง: ถ้าชื่อแท็บคือ "บันทึก"
+        # return gc.open_by_key(SHEET_ID).worksheet("บันทึก") 
+        
+        # **ถ้าชื่อแท็บคือ Sheet1** (ตามค่าเริ่มต้น) 
+        return gc.open_by_key(SHEET_ID).sheet1
+        
     except Exception as e:
+        # Gunicorn จะ Crash ที่นี่ถ้าการเชื่อมต่อ API ล้มเหลว (เช่น 403 Forbidden)
         logger.error(f"Error connecting to Google Sheets. Check SHEET_ID or JSON format: {e}")
         return None
 
